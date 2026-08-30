@@ -47,6 +47,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class Transformer(nn.Module):
+    pos_embed: torch.Tensor
     def __init__(self, vocab_size, embedding_dim, num_heads, max_seq_len):
         super().__init__()
 

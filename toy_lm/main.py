@@ -1,10 +1,3 @@
-"""Placeholder training pipeline for the toy transformer.
-
-Trains model.Transformer on a plain text file, tokenised with the Pleias
-tokenizer downloaded into ../tokenizer/Pleias-1.2b-Preview.
-
-    python main.py --steps 500
-"""
 import argparse
 import time
 from pathlib import Path
