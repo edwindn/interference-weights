@@ -8,9 +8,14 @@ in record batches, which holds the reader near 0.3GB.
 Two background threads keep the training loop fed: one downloads the next shard
 while the current one is being consumed, the other runs the tokeniser ahead of
 the GPU. No epochs -- every token is served exactly once.
+
+Windows pass through a shuffle pool before they are batched, so a batch mixes
+documents (and, with both sources enabled, English and code) drawn from far
+apart in the stream rather than from one contiguous run of the shard.
 """
 
 import queue
+import random
 import threading
 
 import torch
@@ -22,8 +27,9 @@ CODE_COLLECTION = "Github Open Source"
 END_OF_TEXT = "<|end_of_text|>"
 
 COLUMNS = ["language", "collection", "text"]
-ROW_BATCH = 256      # rows decoded per arrow batch
-ENCODE_CHUNK = 16    # docs per tokeniser call
+ROW_BATCH = 256        # rows decoded per arrow batch
+ENCODE_CHUNK = 16      # docs per tokeniser call
+SHUFFLE_WINDOWS = 16384  # windows held for shuffling, ~2.1M tokens at seq_len 128
 
 
 class CorpusExhausted(Exception):
@@ -48,23 +54,37 @@ def code_only(row):
 FILTERS = {"english": english_only, "code": code_only}
 
 
+def make_filter(english, code):
+    """Row predicate for the enabled sources.
+
+    The two are disjoint -- code rows carry the programming language in
+    `language`, never "English" -- so enabling both is a plain union.
+    """
+    keep = [fn for name, fn in FILTERS.items() if (english if name == "english" else code)]
+    if not keep:
+        raise ValueError("no data source enabled: set english_data and/or code_data")
+    if len(keep) == 1:
+        return keep[0]
+    return lambda row: any(fn(row) for fn in keep)
+
+
 class StreamingCorpus:
     """Serves (input, target) windows with the same interface as `TextData`."""
 
-    def __init__(self, tokenizer, seq_len, batch_size, device, mode="english",
-                 num_shards=10, val_batches=20, prefetch=32, files=None):
-        if mode not in FILTERS:
-            raise ValueError(f"mode must be one of {sorted(FILTERS)}, got {mode!r}")
-
+    def __init__(self, tokenizer, seq_len, batch_size, device, english=True, code=False,
+                 num_shards=10, val_batches=20, prefetch=32,
+                 shuffle_windows=SHUFFLE_WINDOWS, files=None):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.device = device
-        self.keep = FILTERS[mode]
+        self.keep = make_filter(english, code)
+        self.sources = [n for n, on in (("english", english), ("code", code)) if on]
         self.files = files or shard_files(num_shards)
         self.eod = tokenizer.token_to_id(END_OF_TEXT)
 
         self.window = seq_len + 1
+        self.shuffle_windows = max(shuffle_windows, batch_size)
         self.tokens_seen = 0
         self.docs_kept = 0
 
@@ -82,6 +102,8 @@ class StreamingCorpus:
             thread.start()
 
         # Held out before any training batch is drawn, so the two never overlap.
+        # The shuffle pool is full by the time the first batch arrives, so the
+        # val split is a mixed sample rather than the head of the first shard.
         self._val = [self._next_batch() for _ in range(val_batches)]
         self._val_pos = 0
 
@@ -118,9 +140,11 @@ class StreamingCorpus:
                         yield row["text"]
 
     def _produce(self):
-        """Tokenise documents into a rolling buffer and emit fixed-size batches."""
+        """Tokenise documents into a rolling buffer and emit shuffled batches."""
         buffer = []
         windows = []
+        pool = torch.empty((self.shuffle_windows, self.window), dtype=torch.long)
+        filled = 0
         try:
             for texts in self._chunks(self._rows(), ENCODE_CHUNK):
                 for encoding in self.tokenizer.encode_batch(texts):
@@ -129,12 +153,29 @@ class StreamingCorpus:
                         buffer.append(self.eod)
 
                 while len(buffer) >= self.window:
-                    windows.append(buffer[:self.window])
+                    window = torch.tensor(buffer[:self.window], dtype=torch.long)
                     del buffer[:self.window]
+                    # Fill the pool first; after that every new window evicts a
+                    # random one, so emitted windows are drawn from a wide span.
+                    if filled < self.shuffle_windows:
+                        pool[filled] = window
+                        filled += 1
+                        continue
+                    slot = random.randrange(self.shuffle_windows)
+                    windows.append(pool[slot].clone())
+                    pool[slot] = window
                     if len(windows) == self.batch_size:
                         if not self._put(windows):
                             return
                         windows = []
+
+            # Stream ended: drain whatever the pool still holds, still shuffled.
+            for slot in random.sample(range(filled), filled):
+                windows.append(pool[slot])
+                if len(windows) == self.batch_size:
+                    if not self._put(windows):
+                        return
+                    windows = []
         except Exception as exc:  # surfaced to the consumer on the next batch()
             self._error = exc
         self._batches.put(None)
@@ -152,7 +193,7 @@ class StreamingCorpus:
 
     def _put(self, windows):
         """Queue one batch as CPU tensors. Returns False once the consumer stops."""
-        block = torch.tensor(windows, dtype=torch.long)
+        block = torch.stack(windows)
         while not self._stop.is_set():
             try:
                 self._batches.put((block[:, :-1], block[:, 1:]), timeout=0.5)

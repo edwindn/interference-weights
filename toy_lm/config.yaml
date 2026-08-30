@@ -4,11 +4,13 @@ model:
   seq_len: 128
 
 training:
-  steps: 1000
+  steps: 100000
   batch_size: 16
   lr: 3.0e-4
   betas: [0.9, 0.95]
   max_grad_norm: 1.0
+  english_data: true
+  code_data: true
 
 eval:
   eval_every: 100

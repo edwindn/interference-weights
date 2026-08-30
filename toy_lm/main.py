@@ -1,4 +1,5 @@
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from tokenizers import Tokenizer
+from tqdm import tqdm
 
 from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
@@ -13,7 +15,6 @@ from utils import MetricsLog
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
-DATA_PATH = ROOT.parent / "data" / "input.txt"
 CONFIG_PATH = ROOT / "config.yaml"
 
 
@@ -25,35 +26,6 @@ def load_config(path):
     for section in config.values():
         flat.update(section)
     return flat
-
-
-class TextData:
-    """Tokenises a text file once, then serves random (input, target) windows."""
-
-    def __init__(self, path, tokenizer, seq_len, batch_size, device, val_frac=0.05):
-        text = Path(path).read_text(encoding="utf-8")
-        ids = tokenizer.encode(text).ids
-        tokens = torch.tensor(ids, dtype=torch.long)
-
-        split = int(len(tokens) * (1 - val_frac))
-        self.splits = {"train": tokens[:split], "val": tokens[split:]}
-        self.seq_len = seq_len
-        self.batch_size = batch_size
-        self.device = device
-
-        for name, part in self.splits.items():
-            if len(part) < seq_len + 1:
-                raise ValueError(f"{name} split has {len(part)} tokens, need > {seq_len}")
-
-    def __len__(self):
-        return len(self.splits["train"]) + len(self.splits["val"])
-
-    def batch(self, split="train"):
-        tokens = self.splits[split]
-        idx = torch.randint(len(tokens) - self.seq_len - 1, (self.batch_size,))
-        inputs = torch.stack([tokens[i:i + self.seq_len] for i in idx])
-        targets = torch.stack([tokens[i + 1:i + self.seq_len + 1] for i in idx])
-        return inputs.to(self.device), targets.to(self.device)
 
 
 def loss_fn(model, inputs, targets):
@@ -75,11 +47,15 @@ def main():
     pre.add_argument("--config", type=Path, default=CONFIG_PATH)
     cfg = load_config(pre.parse_known_args()[0].config)
 
+    # Which halves of the corpus to train on. Both is a full mix; neither is a
+    # config mistake, so say so before anything is downloaded.
+    sources = [name for name, key in (("english", "english_data"), ("code", "code_data"))
+               if cfg[key]]
+    if not sources:
+        raise SystemExit("config: english_data and code_data are both false, "
+                         "enable at least one")
+
     p = argparse.ArgumentParser(parents=[pre])
-    p.add_argument("--data", type=Path, default=DATA_PATH)
-    p.add_argument("--stream", action="store_true",
-                   help="stream PleIAs/common_corpus instead of reading --data")
-    p.add_argument("--stream-mode", choices=("english", "code"), default="english")
     p.add_argument("--shards", type=int, default=10, help="shards to stream, 1..10")
     p.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH)
     p.add_argument("--seed", type=int, default=0)
@@ -91,35 +67,37 @@ def main():
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
+    random.seed(args.seed)  # the loader's shuffle pool draws from `random`
     device = torch.device(args.device)
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     vocab_size = tokenizer.get_vocab_size()
 
-    if args.stream:
-        data = StreamingCorpus(tokenizer, cfg["seq_len"], cfg["batch_size"], device,
-                               mode=args.stream_mode, num_shards=args.shards,
-                               val_batches=cfg["eval_batches"])
-    else:
-        data = TextData(args.data, tokenizer, cfg["seq_len"], cfg["batch_size"], device)
+    data = StreamingCorpus(tokenizer, cfg["seq_len"], cfg["batch_size"], device,
+                           english=cfg["english_data"], code=cfg["code_data"],
+                           num_shards=args.shards, val_batches=cfg["eval_batches"])
     model = Transformer(vocab_size, cfg["embedding_dim"], cfg["num_heads"], cfg["seq_len"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], betas=tuple(cfg["betas"]),
                                   weight_decay=0.0)
 
     params = sum(p.numel() for p in model.parameters())
-    source = f"stream {args.stream_mode} x{args.shards}" if args.stream else f"{len(data)} tokens"
-    print(f"device {device} | vocab {vocab_size} | {source} | {params/1e6:.1f}M params")
+    print(f"device {device} | vocab {vocab_size} | "
+          f"stream {'+'.join(sources)} x{args.shards} | {params/1e6:.1f}M params")
 
     metrics = MetricsLog(args.log_dir, args.log_name)
     print(f"logging to {metrics.path}")
 
     model.train()
     start = time.time()
+    # The run is budgeted in tokens, so the bar tracks tokens rather than steps.
+    step_tokens = cfg["batch_size"] * cfg["seq_len"]
+    bar = tqdm(total=cfg["steps"] * step_tokens, unit="tok", unit_scale=True,
+               dynamic_ncols=True, desc="train", smoothing=0.05)
     for step in range(1, cfg["steps"] + 1):
         try:
             inputs, targets = data.batch("train")
         except CorpusExhausted as exc:
-            print(f"stream exhausted at step {step} ({exc})")
+            bar.write(f"stream exhausted at step {step} ({exc})")
             break
         loss = loss_fn(model, inputs, targets)
 
@@ -131,20 +109,26 @@ def main():
             model.parameters(), max_grad_norm if max_grad_norm > 0 else float("inf"))
         optimizer.step()
 
+        train_loss = loss.item()
+        bar.update(step_tokens)
+        bar.set_postfix(loss=f"{train_loss:.3f}", gnorm=f"{grad_norm.item():.2f}",
+                        refresh=False)
+
         val_loss = None
         if step % cfg["eval_every"] == 0 or step == cfg["steps"]:
             val_loss = evaluate(model, data, cfg["eval_batches"])
-            print(f"step {step:>5} | train {loss.item():.3f} | val {val_loss:.3f} "
-                  f"| gnorm {grad_norm.item():.2f} | {time.time() - start:.1f}s")
+            # bar.write keeps these lines from being overwritten by the bar
+            bar.write(f"step {step:>6} | train {train_loss:.3f} | val {val_loss:.3f} "
+                      f"| gnorm {grad_norm.item():.2f} | {time.time() - start:.1f}s")
 
-        metrics.log(step, loss.item(), grad_norm.item(), cfg["lr"],
+        metrics.log(step, train_loss, grad_norm.item(), cfg["lr"],
                     time.time() - start, val_loss=val_loss)
 
+    bar.close()
     metrics.close()
 
-    if args.stream:
-        data.close()
-        print(f"streamed {data.tokens_seen/1e6:.1f}M tokens")
+    data.close()
+    print(f"streamed {data.tokens_seen/1e6:.1f}M tokens")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "args": vars(args), "config": cfg}, args.out)
