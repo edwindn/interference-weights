@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
+from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +59,10 @@ def evaluate(model, data, batches=20):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, default=DATA_PATH)
+    p.add_argument("--stream", action="store_true",
+                   help="stream PleIAs/common_corpus instead of reading --data")
+    p.add_argument("--stream-mode", choices=("english", "code"), default="english")
+    p.add_argument("--shards", type=int, default=10, help="shards to stream, 1..10")
     p.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=16)
@@ -77,17 +82,26 @@ def main():
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     vocab_size = tokenizer.get_vocab_size()
 
-    data = TextData(args.data, tokenizer, args.seq_len, args.batch_size, device)
+    if args.stream:
+        data = StreamingCorpus(tokenizer, args.seq_len, args.batch_size, device,
+                               mode=args.stream_mode, num_shards=args.shards)
+    else:
+        data = TextData(args.data, tokenizer, args.seq_len, args.batch_size, device)
     model = Transformer(vocab_size, args.embedding_dim, args.num_heads, args.seq_len).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
 
     params = sum(p.numel() for p in model.parameters())
-    print(f"device {device} | vocab {vocab_size} | {len(data)} tokens | {params/1e6:.1f}M params")
+    source = f"stream {args.stream_mode} x{args.shards}" if args.stream else f"{len(data)} tokens"
+    print(f"device {device} | vocab {vocab_size} | {source} | {params/1e6:.1f}M params")
 
     model.train()
     start = time.time()
     for step in range(1, args.steps + 1):
-        inputs, targets = data.batch("train")
+        try:
+            inputs, targets = data.batch("train")
+        except CorpusExhausted as exc:
+            print(f"stream exhausted at step {step} ({exc})")
+            break
         loss = loss_fn(model, inputs, targets)
 
         optimizer.zero_grad(set_to_none=True)
@@ -98,6 +112,10 @@ def main():
         if step % args.eval_every == 0 or step == args.steps:
             print(f"step {step:>5} | train {loss.item():.3f} | val {evaluate(model, data):.3f} "
                   f"| {time.time() - start:.1f}s")
+
+    if args.stream:
+        data.close()
+        print(f"streamed {data.tokens_seen/1e6:.1f}M tokens")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "args": vars(args)}, args.out)
