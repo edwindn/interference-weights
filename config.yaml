@@ -1,0 +1,16 @@
+model:
+  activation: relu
+  activation_after: true
+  init_method: normal
+  
+data:
+  num_features: 20
+  projected_dim: 5
+  sparsity: 0.99
+  importance_base: 1.0
+
+training:
+  num_samples: 500000
+  batch_size: 1024
+  lr: 0.01
+  epochs: 1
