@@ -3,7 +3,8 @@
 `load_dataset(streaming=True)` is not incremental on this corpus: every shard is
 a single ~430MB row group, so the reader decodes the whole thing and sits at a
 ~3.8GB floor. Instead each shard is fetched to disk once and read memory-mapped
-in record batches, which holds the reader near 0.3GB.
+in record batches, which holds the reader near 0.3GB. A spent shard is deleted,
+so disk holds about two at a time rather than the whole corpus.
 
 Two background threads keep the training loop fed: one downloads the next shard
 while the current one is being consumed, the other runs the tokeniser ahead of
@@ -17,6 +18,7 @@ apart in the stream rather than from one contiguous run of the shard.
 import queue
 import random
 import threading
+from pathlib import Path
 
 import torch
 import pyarrow.parquet as pq
@@ -73,7 +75,7 @@ class StreamingCorpus:
 
     def __init__(self, tokenizer, seq_len, batch_size, device, english=True, code=False,
                  num_shards=10, val_batches=20, prefetch=32,
-                 shuffle_windows=SHUFFLE_WINDOWS, files=None):
+                 shuffle_windows=SHUFFLE_WINDOWS, files=None, delete_shards=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
@@ -85,8 +87,10 @@ class StreamingCorpus:
 
         self.window = seq_len + 1
         self.shuffle_windows = max(shuffle_windows, batch_size)
+        self.delete_shards = delete_shards
         self.tokens_seen = 0
         self.docs_kept = 0
+        self.bytes_freed = 0
 
         self._stop = threading.Event()
         self._error = None
@@ -124,6 +128,21 @@ class StreamingCorpus:
             self._error = exc
         self._paths.put(None)
 
+    def _release(self, path):
+        """Delete a spent shard. hf_hub_download leaves a snapshot symlink and the
+        blob it points at; both have to go for the space to come back.
+        """
+        path = Path(path)
+        try:
+            blob = path.resolve()
+            size = blob.stat().st_size
+            path.unlink(missing_ok=True)
+            if blob != path:
+                blob.unlink(missing_ok=True)
+            self.bytes_freed += size
+        except OSError:
+            pass
+
     def _rows(self):
         """Yield the text of matching documents, one shard at a time."""
         while not self._stop.is_set():
@@ -131,13 +150,18 @@ class StreamingCorpus:
             if path is None:
                 return
             reader = pq.ParquetFile(path, memory_map=True)
-            for arrow_batch in reader.iter_batches(batch_size=ROW_BATCH, columns=COLUMNS):
-                if self._stop.is_set():
-                    return
-                for row in arrow_batch.to_pylist():
-                    if row["text"] and self.keep(row):
-                        self.docs_kept += 1
-                        yield row["text"]
+            try:
+                for arrow_batch in reader.iter_batches(batch_size=ROW_BATCH, columns=COLUMNS):
+                    if self._stop.is_set():
+                        return
+                    for row in arrow_batch.to_pylist():
+                        if row["text"] and self.keep(row):
+                            self.docs_kept += 1
+                            yield row["text"]
+            finally:
+                reader.close()  # drop the mmap before the file
+                if self.delete_shards:
+                    self._release(path)
 
     def _produce(self):
         """Tokenise documents into a rolling buffer and emit shuffled batches."""
