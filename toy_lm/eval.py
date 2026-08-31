@@ -13,18 +13,17 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from tokenizers import Tokenizer
 from tqdm import tqdm
 
 import plot
 from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
-from utils import MetricsLog, pick_device
+from utils import MetricsLog, load_tokenizer, pick_device
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
 CONFIG_PATH = ROOT / "config.yaml"
-ARCH_KEYS = ("embedding_dim", "num_heads", "seq_len")
+ARCH_KEYS = ("vocab_size", "embedding_dim", "num_heads", "seq_len")
 
 
 def default_checkpoint():
@@ -63,6 +62,7 @@ def main():
     # weights_only would reject the Path objects the checkpoint keeps in "args"
     ckpt = torch.load(known.ckpt, map_location="cpu", weights_only=False)
     saved = ckpt.get("config") or {}
+    saved.setdefault("vocab_size", ckpt["model"]["lm_head.weight"].shape[0])
     stale = [k for k in ARCH_KEYS if k in saved and saved[k] != cfg.get(k)]
     cfg.update(saved)
     if stale:
@@ -96,7 +96,7 @@ def main():
     random.seed(args.seed)  # the loader's shuffle pool draws from `random`
     device = pick_device()
 
-    tokenizer = Tokenizer.from_file(str(args.tokenizer))
+    tokenizer = load_tokenizer(args.tokenizer, cfg["vocab_size"])
     vocab_size = tokenizer.get_vocab_size()
 
     # val_batches=0: every batch here is already unseen, so a held-out split

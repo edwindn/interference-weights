@@ -1,10 +1,13 @@
 import csv
+import json
+import math
 import random
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
+from tokenizers import Tokenizer
 
 
 def set_seed(seed):
@@ -25,6 +28,40 @@ def pick_device():
     if mps is not None and mps.is_available():
         return torch.device("mps")
     raise SystemExit("no gpu available: neither cuda nor Apple Metal (mps)")
+
+
+def load_tokenizer(path, vocab_size=None):
+    """The tokenizer with every id >= `vocab_size` dropped. Lossless above 246."""
+    path = Path(path)
+    full = Tokenizer.from_file(str(path))
+    if vocab_size is None or vocab_size == full.get_vocab_size():
+        return full
+    if not 0 < vocab_size <= full.get_vocab_size():
+        raise SystemExit(f"config: vocab_size must be in 1..{full.get_vocab_size()}, "
+                         f"got {vocab_size}")
+
+    spec = json.loads(path.read_text())
+    kept = {s: i for s, i in spec["model"]["vocab"].items() if i < vocab_size}
+    lost = [i for s, i in spec["model"]["vocab"].items() if len(s) == 1 and i >= vocab_size]
+    if lost:
+        raise SystemExit(f"config: vocab_size {vocab_size} drops {len(lost)} "
+                         f"single-character token(s); use at least {max(lost) + 1}")
+    spec["model"]["vocab"] = kept
+    spec["model"]["merges"] = [m for m in spec["model"]["merges"]
+                              if m[0] in kept and m[1] in kept and m[0] + m[1] in kept]
+    spec["added_tokens"] = [a for a in spec.get("added_tokens", []) if a["id"] < vocab_size]
+    return Tokenizer.from_str(json.dumps(spec))
+
+
+def lr_at(step, max_lr, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """Linear warmup to max_lr at `warmup_steps`, then cosine to
+    min_lr_ratio*max_lr at `total_steps`. Steps are 1-based.
+    """
+    if step <= warmup_steps:
+        return max_lr * step / max(warmup_steps, 1)
+    progress = min((step - warmup_steps) / max(total_steps - warmup_steps, 1), 1.0)
+    min_lr = max_lr * min_lr_ratio
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def sinusoidal_encoding(seq_len, dim, max_timescale=2**16):

@@ -5,8 +5,9 @@
     python plot.py --log logs/train_20260830_214426.log
 
 Raw per-step values are drawn faded; an EMA rides on top in full strength.
-Loss and gradient norm sit side by side in one PNG -- unless the log carries no
-gradient norms (an eval run has none), in which case loss gets the whole figure.
+Loss, gradient norm and learning rate sit side by side in one PNG. A panel is
+dropped when the log has no such column, so an eval run -- which records neither
+gradients nor lr -- leaves loss the whole figure.
 
 `render()` is the entry point eval.py reuses.
 """
@@ -15,7 +16,7 @@ import argparse
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # write a file, never open a window
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -25,18 +26,18 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_LOG = ROOT / "logs" / "latest.log"
 CONFIG_PATH = ROOT / "config.yaml"
 
-# Validated categorical slots 1-3 (see the data-viz palette); one hue per entity.
-TRAIN = "#2a78d6"   # blue
-VAL = "#eb6834"     # orange
-GNORM = "#1baf7a"   # aqua
+TRAIN = "#2a78d6"
+VAL = "#eb6834"
+GNORM = "#1baf7a"
+LR = "#8f5bd6"
 
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 MUTED = "#52514e"
 GRID = "#e4e3df"
 
-RAW_ALPHA = 0.28    # the faded true-data trace
-LINE_W = 2.0        # EMA on top
+RAW_ALPHA = 0.28
+LINE_W = 2.0
 
 
 def read_log(path):
@@ -54,11 +55,11 @@ def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
 
-def clip_threshold():
-    """max_grad_norm from config.yaml, for the reference line. None if unreadable."""
+def config_value(key):
+    """A positive `training` value from config.yaml, or None if unreadable."""
     try:
         with open(CONFIG_PATH) as f:
-            value = yaml.safe_load(f)["training"]["max_grad_norm"]
+            value = yaml.safe_load(f)["training"][key]
         return value if value and value > 0 else None
     except (OSError, KeyError, TypeError):
         return None
@@ -68,7 +69,7 @@ def style(ax, title, ylabel):
     ax.set_title(title, color=TEXT, fontsize=11, loc="left", pad=10)
     ax.set_xlabel("step", color=MUTED, fontsize=9)
     ax.set_ylabel(ylabel, color=MUTED, fontsize=9)
-    ax.grid(True, color=GRID, linewidth=0.8, linestyle="-")  # hairline, solid, recessive
+    ax.grid(True, color=GRID, linewidth=0.8, linestyle="-")
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -79,7 +80,6 @@ def style(ax, title, ylabel):
 
 
 def end_label(ax, x, y, text, color):
-    """Visible value at the line end -- also the relief for low-contrast hues."""
     ax.annotate(text, xy=(x, y), xytext=(4, 0), textcoords="offset points",
                 color=TEXT, fontsize=8, va="center", ha="left",
                 bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE, ec=color, lw=1.0))
@@ -99,14 +99,14 @@ def render(log, out=None, ema_span_hint=50, dpi=150,
     span = ema_span(ema_span_hint, len(df))
     out = Path(out) if out else log.with_suffix(".png")
 
-    # An eval run logs no gradients, so that panel would be empty -- drop it.
     has_grad = "grad_norm" in df and df.grad_norm.notna().any()
-    width = 11 if has_grad else 6.5
-    fig, axes = plt.subplots(1, 2 if has_grad else 1, figsize=(width, 4.2),
+    has_lr = "lr" in df and df.lr.notna().any()
+    panels = 1 + has_grad + has_lr
+    fig, axes = plt.subplots(1, panels, figsize=(6.5 if panels == 1 else 5.5 * panels, 4.2),
                              facecolor=SURFACE, squeeze=False)
     ax_loss = axes[0, 0]
+    nxt = 1
 
-    # -- loss ---------------------------------------------------------------
     ax_loss.plot(df.step, df.train_loss, color=TRAIN, alpha=RAW_ALPHA, linewidth=1.0)
     smoothed = ema(df.train_loss, span)
     ax_loss.plot(df.step, smoothed, color=TRAIN, linewidth=LINE_W,
@@ -125,16 +125,16 @@ def render(log, out=None, ema_span_hint=50, dpi=150,
                   f"{val.val_loss.iloc[-1]:.3f}", VAL)
     ax_loss.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
 
-    # -- gradient norm ------------------------------------------------------
     if has_grad:
-        ax_grad = axes[0, 1]
+        ax_grad = axes[0, nxt]
+        nxt += 1
         ax_grad.plot(df.step, df.grad_norm, color=GNORM, alpha=RAW_ALPHA, linewidth=1.0)
         smoothed_g = ema(df.grad_norm, span)
         ax_grad.plot(df.step, smoothed_g, color=GNORM, linewidth=LINE_W,
                      solid_joinstyle="round", solid_capstyle="round",
                      label=f"grad norm (EMA {span})")
 
-        clip = clip_threshold()
+        clip = config_value("max_grad_norm")
         if clip is not None:
             ax_grad.axhline(clip, color=MUTED, linewidth=1.0, alpha=0.6,
                             label=f"clip at {clip:g}")
@@ -143,6 +143,24 @@ def render(log, out=None, ema_span_hint=50, dpi=150,
         end_label(ax_grad, df.step.iloc[-1], smoothed_g.iloc[-1],
                   f"{smoothed_g.iloc[-1]:.2f}", GNORM)
         ax_grad.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
+
+    if has_lr:
+        ax_lr = axes[0, nxt]
+        ax_lr.plot(df.step, df.lr, color=LR, linewidth=LINE_W,
+                   solid_joinstyle="round", solid_capstyle="round", label="learning rate")
+
+        warmup = config_value("warmup_steps")
+        if warmup is not None and df.step.iloc[-1] >= warmup:
+            ax_lr.axvline(warmup, color=MUTED, linewidth=1.0, alpha=0.6,
+                          label=f"warmup ends at {warmup:g}")
+
+        ax_lr.set_ylim(bottom=0)
+        style(ax_lr, "Learning rate", "lr")
+        ax_lr.ticklabel_format(style="sci", scilimits=(0, 0), axis="y")
+        ax_lr.yaxis.get_offset_text().set_color(MUTED)
+        ax_lr.yaxis.get_offset_text().set_fontsize(8)
+        end_label(ax_lr, df.step.iloc[-1], df.lr.iloc[-1], f"{df.lr.iloc[-1]:.2e}", LR)
+        ax_lr.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
 
     last = df.step.iloc[-1]
     fig.suptitle(f"{log.name}  ·  {len(df)} steps logged (through step {last:.0f})",

@@ -5,12 +5,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from tokenizers import Tokenizer
 from tqdm import tqdm
 
 from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
-from utils import MetricsLog, pick_device, set_seed
+from utils import MetricsLog, load_tokenizer, lr_at, pick_device, set_seed
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
@@ -54,6 +53,10 @@ def main():
         raise SystemExit("config: english_data and code_data are both false, "
                          "enable at least one")
 
+    if not 0.0 <= cfg["min_lr_ratio"] <= 1.0:
+        raise SystemExit("config: min_lr_ratio must be in 0..1, "
+                         f"got {cfg['min_lr_ratio']}")
+
     p = argparse.ArgumentParser(parents=[pre])
     p.add_argument("--shards", type=int, default=10, help="shards to stream, 1..10")
     p.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH)
@@ -67,8 +70,9 @@ def main():
     set_seed(args.seed)
     device = pick_device()
 
-    tokenizer = Tokenizer.from_file(str(args.tokenizer))
+    tokenizer = load_tokenizer(args.tokenizer, cfg["vocab_size"])
     vocab_size = tokenizer.get_vocab_size()
+    assert vocab_size == cfg["vocab_size"], (vocab_size, cfg["vocab_size"])
 
     data = StreamingCorpus(tokenizer, cfg["seq_len"], cfg["batch_size"], device,
                            english=cfg["english_data"], code=cfg["code_data"],
@@ -104,6 +108,11 @@ def main():
         max_grad_norm = cfg["max_grad_norm"]
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_grad_norm if max_grad_norm > 0 else float("inf"))
+
+        lr = lr_at(step, cfg["lr"], cfg["warmup_steps"], cfg["steps"],
+                   cfg["min_lr_ratio"])
+        for group in optimizer.param_groups:
+            group["lr"] = lr
         optimizer.step()
 
         train_loss = loss.item()
@@ -118,7 +127,7 @@ def main():
             bar.write(f"step {step:>6} | train {train_loss:.3f} | val {val_loss:.3f} "
                       f"| gnorm {grad_norm.item():.2f} | {time.time() - start:.1f}s")
 
-        metrics.log(step, train_loss, grad_norm.item(), cfg["lr"],
+        metrics.log(step, train_loss, grad_norm.item(), lr,
                     time.time() - start, val_loss=val_loss)
 
     bar.close()

@@ -8,10 +8,9 @@ from pathlib import Path
 
 import torch
 import yaml
-from tokenizers import Tokenizer
 
 from model import Transformer
-from utils import pick_device
+from utils import load_tokenizer, pick_device
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
@@ -51,15 +50,17 @@ def main():
     random.seed(cfg["seed"])
     device = pick_device()
 
-    tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
+    # weights_only would reject the Path objects the checkpoint keeps in "args"
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_cfg = ckpt["config"]
+    vocab_size = model_cfg.get("vocab_size", ckpt["model"]["lm_head.weight"].shape[0])
+
+    tokenizer = load_tokenizer(TOKENIZER_PATH, vocab_size)
     eos_id = tokenizer.token_to_id(EOS)
     if eos_id is None:
         raise SystemExit(f"tokenizer has no {EOS}, generations could never stop early")
 
-    # weights_only would reject the Path objects the checkpoint keeps in "args"
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model_cfg = ckpt["config"]
-    model = Transformer(tokenizer.get_vocab_size(), model_cfg["embedding_dim"],
+    model = Transformer(vocab_size, model_cfg["embedding_dim"],
                         model_cfg["num_heads"], model_cfg["seq_len"]).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
