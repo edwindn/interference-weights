@@ -2,3 +2,9 @@
 *.png
 tokenizer/
 *.log
+.hf_secret
+weights/
+toy_lm/generations/
+__pycache__/
+*.pyc
+uv.lock
