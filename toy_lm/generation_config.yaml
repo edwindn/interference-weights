@@ -1,0 +1,8 @@
+checkpoint: weights/toy_lm.pt
+out_dir: generations
+num_generations: 10
+max_new_tokens: 256
+temperature: 1.0
+top_k: 50
+prompt: "To be or not to be, "
+seed: 0
