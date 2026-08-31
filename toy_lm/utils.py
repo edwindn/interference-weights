@@ -5,6 +5,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
+def pick_device():
+    """cuda, else Apple Metal; never a silent cpu fallback."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    raise SystemExit("no gpu available: neither cuda nor Apple Metal (mps)")
+
+
 def sinusoidal_encoding(seq_len, dim, max_timescale=2**16):
     PE = np.empty((dim, seq_len))
     pos = np.arange(seq_len).reshape(1, -1)
@@ -34,14 +44,14 @@ class MetricsLog:
         except OSError:
             pass
 
-    def log(self, step, train_loss, grad_norm, lr, elapsed_s, val_loss=None):
-        """val_loss is blank on steps where no eval ran."""
+    def log(self, step, train_loss, grad_norm=None, lr=None, elapsed_s=0.0, val_loss=None):
+        """val_loss, grad_norm and lr are blank on rows that have no such value."""
         self._writer.writerow({
             "step": step,
             "train_loss": f"{train_loss:.6f}",
             "val_loss": "" if val_loss is None else f"{val_loss:.6f}",
-            "grad_norm": f"{grad_norm:.6f}",
-            "lr": f"{lr:.8g}",
+            "grad_norm": "" if grad_norm is None else f"{grad_norm:.6f}",
+            "lr": "" if lr is None else f"{lr:.8g}",
             "elapsed_s": f"{elapsed_s:.3f}",
         })
         self._file.flush()

@@ -5,7 +5,10 @@
     python plot.py --log logs/train_20260830_214426.log
 
 Raw per-step values are drawn faded; an EMA rides on top in full strength.
-Loss and gradient norm sit side by side in one PNG.
+Loss and gradient norm sit side by side in one PNG -- unless the log carries no
+gradient norms (an eval run has none), in which case loss gets the whole figure.
+
+`render()` is the entry point eval.py reuses.
 """
 
 import argparse
@@ -82,37 +85,38 @@ def end_label(ax, x, y, text, color):
                 bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE, ec=color, lw=1.0))
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--log", type=Path, default=DEFAULT_LOG)
-    p.add_argument("--out", type=Path, default=None, help="default: <log>.png")
-    p.add_argument("--ema-span", type=int, default=50)
-    p.add_argument("--dpi", type=int, default=150)
-    args = p.parse_args()
+def render(log, out=None, ema_span_hint=50, dpi=150,
+           train_name="train", val_name="val"):
+    """Draw `log` to a PNG and return its path. Names label the two loss series."""
+    log = Path(log)
+    if not log.exists():
+        raise SystemExit(f"no log at {log} -- has a run started?")
 
-    if not args.log.exists():
-        raise SystemExit(f"no log at {args.log} -- has a run started?")
-
-    df = read_log(args.log)
+    df = read_log(log)
     if df.empty:
-        raise SystemExit(f"{args.log} has no rows yet")
+        raise SystemExit(f"{log} has no rows yet")
 
-    span = ema_span(args.ema_span, len(df))
-    out = args.out or args.log.with_suffix(".png")
+    span = ema_span(ema_span_hint, len(df))
+    out = Path(out) if out else log.with_suffix(".png")
 
-    fig, (ax_loss, ax_grad) = plt.subplots(1, 2, figsize=(11, 4.2), facecolor=SURFACE)
+    # An eval run logs no gradients, so that panel would be empty -- drop it.
+    has_grad = "grad_norm" in df and df.grad_norm.notna().any()
+    width = 11 if has_grad else 6.5
+    fig, axes = plt.subplots(1, 2 if has_grad else 1, figsize=(width, 4.2),
+                             facecolor=SURFACE, squeeze=False)
+    ax_loss = axes[0, 0]
 
     # -- loss ---------------------------------------------------------------
     ax_loss.plot(df.step, df.train_loss, color=TRAIN, alpha=RAW_ALPHA, linewidth=1.0)
     smoothed = ema(df.train_loss, span)
     ax_loss.plot(df.step, smoothed, color=TRAIN, linewidth=LINE_W,
                  solid_joinstyle="round", solid_capstyle="round",
-                 label=f"train (EMA {span})")
+                 label=f"{train_name} (EMA {span})")
 
     val = df.dropna(subset=["val_loss"]) if "val_loss" in df else df.iloc[0:0]
     if not val.empty:
         ax_loss.plot(val.step, val.val_loss, color=VAL, linewidth=LINE_W,
-                     marker="o", markersize=4.5, label="val")
+                     marker="o", markersize=4.5, label=val_name)
 
     style(ax_loss, "Loss", "cross-entropy")
     end_label(ax_loss, df.step.iloc[-1], smoothed.iloc[-1], f"{smoothed.iloc[-1]:.3f}", TRAIN)
@@ -122,27 +126,43 @@ def main():
     ax_loss.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
 
     # -- gradient norm ------------------------------------------------------
-    ax_grad.plot(df.step, df.grad_norm, color=GNORM, alpha=RAW_ALPHA, linewidth=1.0)
-    smoothed_g = ema(df.grad_norm, span)
-    ax_grad.plot(df.step, smoothed_g, color=GNORM, linewidth=LINE_W,
-                 solid_joinstyle="round", solid_capstyle="round",
-                 label=f"grad norm (EMA {span})")
+    if has_grad:
+        ax_grad = axes[0, 1]
+        ax_grad.plot(df.step, df.grad_norm, color=GNORM, alpha=RAW_ALPHA, linewidth=1.0)
+        smoothed_g = ema(df.grad_norm, span)
+        ax_grad.plot(df.step, smoothed_g, color=GNORM, linewidth=LINE_W,
+                     solid_joinstyle="round", solid_capstyle="round",
+                     label=f"grad norm (EMA {span})")
 
-    clip = clip_threshold()
-    if clip is not None:
-        ax_grad.axhline(clip, color=MUTED, linewidth=1.0, alpha=0.6,
-                        label=f"clip at {clip:g}")
+        clip = clip_threshold()
+        if clip is not None:
+            ax_grad.axhline(clip, color=MUTED, linewidth=1.0, alpha=0.6,
+                            label=f"clip at {clip:g}")
 
-    style(ax_grad, "Gradient norm (pre-clip)", "L2 norm")
-    end_label(ax_grad, df.step.iloc[-1], smoothed_g.iloc[-1], f"{smoothed_g.iloc[-1]:.2f}", GNORM)
-    ax_grad.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
+        style(ax_grad, "Gradient norm (pre-clip)", "L2 norm")
+        end_label(ax_grad, df.step.iloc[-1], smoothed_g.iloc[-1],
+                  f"{smoothed_g.iloc[-1]:.2f}", GNORM)
+        ax_grad.legend(frameon=False, fontsize=8, labelcolor=MUTED, loc="upper right")
 
     last = df.step.iloc[-1]
-    fig.suptitle(f"{args.log.name}  ·  {len(df)} steps logged (through step {last:.0f})",
+    fig.suptitle(f"{log.name}  ·  {len(df)} steps logged (through step {last:.0f})",
                  color=MUTED, fontsize=9, x=0.005, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out, dpi=args.dpi, facecolor=SURFACE)
+    fig.savefig(out, dpi=dpi, facecolor=SURFACE)
+    plt.close(fig)
     print(f"{out}  ({len(df)} rows, EMA span {span})")
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--log", type=Path, default=DEFAULT_LOG)
+    p.add_argument("--out", type=Path, default=None, help="default: <log>.png")
+    p.add_argument("--ema-span", type=int, default=50)
+    p.add_argument("--dpi", type=int, default=150)
+    args = p.parse_args()
+
+    render(args.log, args.out, args.ema_span, args.dpi)
 
 
 if __name__ == "__main__":

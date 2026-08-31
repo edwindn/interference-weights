@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
-from utils import MetricsLog
+from utils import MetricsLog, pick_device
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
@@ -63,12 +63,11 @@ def main():
     p.add_argument("--log-name", type=str, default="train")
     p.add_argument("--prompt", type=str, default="To be or not to be, ")
     p.add_argument("--out", type=Path, default=ROOT / "checkpoints" / "toy_lm.pt")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)  # the loader's shuffle pool draws from `random`
-    device = torch.device(args.device)
+    device = pick_device()
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     vocab_size = tokenizer.get_vocab_size()
