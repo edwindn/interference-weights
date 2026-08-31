@@ -1,9 +1,21 @@
 import csv
+import random
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def set_seed(seed):
+    """Seed every RNG a run draws from: `random` (the loader's shuffle pool),
+    numpy, and torch on cpu plus whichever accelerator is in use.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)  # covers cuda and mps too
+    torch.cuda.manual_seed_all(seed)  # no-op without cuda
+
 
 def pick_device():
     """cuda, else Apple Metal; never a silent cpu fallback."""

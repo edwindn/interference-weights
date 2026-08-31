@@ -1,5 +1,4 @@
 import argparse
-import random
 import time
 from pathlib import Path
 
@@ -11,7 +10,7 @@ from tqdm import tqdm
 
 from dataloader import CorpusExhausted, StreamingCorpus
 from model import Transformer
-from utils import MetricsLog, pick_device
+from utils import MetricsLog, pick_device, set_seed
 
 ROOT = Path(__file__).resolve().parent
 TOKENIZER_PATH = ROOT.parent / "tokenizer" / "Pleias-1.2b-Preview" / "tokenizer.json"
@@ -58,15 +57,14 @@ def main():
     p = argparse.ArgumentParser(parents=[pre])
     p.add_argument("--shards", type=int, default=10, help="shards to stream, 1..10")
     p.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=cfg["seed"])
     p.add_argument("--log-dir", type=Path, default=ROOT / "logs")
     p.add_argument("--log-name", type=str, default="train")
     p.add_argument("--prompt", type=str, default="To be or not to be, ")
     p.add_argument("--out", type=Path, default=ROOT / "checkpoints" / "toy_lm.pt")
     args = p.parse_args()
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)  # the loader's shuffle pool draws from `random`
+    set_seed(args.seed)
     device = pick_device()
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
