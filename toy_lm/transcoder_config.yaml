@@ -1,0 +1,21 @@
+transcoder:
+  ckpt: checkpoints/toy_lm_0.pt   # frozen transformer whose MLP is being fit; relative to this file
+  num_features: 4096
+  epsilon: 0.01                   # JumpReLU threshold, in units of the pre-activation
+  l1_coeff: 3.0e-4
+
+training:
+  seed: 5
+  steps: 20000
+  batch_size: 16
+  lr: 1.0e-3
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  betas: [0.9, 0.999]
+  max_grad_norm: 1.0
+  english_data: true
+  code_data: true
+
+eval:
+  eval_every: 100
+  eval_batches: 20

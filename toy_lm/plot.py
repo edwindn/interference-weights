@@ -86,7 +86,7 @@ def end_label(ax, x, y, text, color):
 
 
 def render(log, out=None, ema_span_hint=50, dpi=150,
-           train_name="train", val_name="val"):
+           train_name="train", val_name="val", ylabel="cross-entropy"):
     """Draw `log` to a PNG and return its path. Names label the two loss series."""
     log = Path(log)
     if not log.exists():
@@ -118,7 +118,7 @@ def render(log, out=None, ema_span_hint=50, dpi=150,
         ax_loss.plot(val.step, val.val_loss, color=VAL, linewidth=LINE_W,
                      marker="o", markersize=4.5, label=val_name)
 
-    style(ax_loss, "Loss", "cross-entropy")
+    style(ax_loss, "Loss", ylabel)
     end_label(ax_loss, df.step.iloc[-1], smoothed.iloc[-1], f"{smoothed.iloc[-1]:.3f}", TRAIN)
     if not val.empty:
         end_label(ax_loss, val.step.iloc[-1], val.val_loss.iloc[-1],

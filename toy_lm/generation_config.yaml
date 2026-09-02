@@ -1,4 +1,4 @@
-checkpoint: checkpoints/toy_lm.pt
+checkpoint: checkpoints/toy_lm_0.pt
 out_dir: generations
 num_generations: 10
 max_new_tokens: 256

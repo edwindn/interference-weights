@@ -8,3 +8,4 @@ toy_lm/generations/
 __pycache__/
 *.pyc
 uv.lock
+**DS_store**
